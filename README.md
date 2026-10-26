@@ -21,6 +21,8 @@ If you use **Android Wireless debugging**, `adb pair`, `adb connect` or `adb tcp
 > Author: [mehdirzfx](https://github.com/mehdirzfx)
 
 ---
+## Screenshot
+<img width="602" height="665" alt="image" src="https://github.com/user-attachments/assets/c4cedbce-c090-4bfb-86e7-0f3654bdcc5c" />
 
 ## Features
 
