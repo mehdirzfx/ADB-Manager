@@ -51,8 +51,6 @@ class MainForm : Form
         log.BackColor = Color.Black;
         log.ForeColor = Color.LightGreen;
         log.Font = new Font("Consolas", 9f);
-        log.Size = new Size(560, 72);
-        log.MinimumSize = new Size(560, 72);
 
         // inputs
         txtAdb.Dock = DockStyle.Fill;
@@ -92,9 +90,9 @@ class MainForm : Form
         lstDevices.MinimumSize = new Size(250, 70);
 
         var serverRow = Row(
-            Btn("Refresh", RefreshDevices, 100),
-            Btn("Start server", async () => { Log(await Adb("start-server")); await RefreshDevices(); }, 100),
-            Btn("Kill server", async () => { Log(await Adb("kill-server")); await RefreshDevices(); }, 100),
+            Btn("Refresh", ct => RefreshDevices(ct), 100),
+            Btn("Start server", async ct => { Log(await Adb("start-server", ct: ct)); await RefreshDevices(ct); }, 100),
+            Btn("Kill server", async ct => { Log(await Adb("kill-server", ct: ct)); await RefreshDevices(ct); }, 100),
             Btn("Restart server", RestartServer, 100));
         devTbl.Controls.Add(serverRow, 0, 0);
         devTbl.SetColumnSpan(serverRow, 2);
@@ -108,7 +106,7 @@ class MainForm : Form
             Dock = DockStyle.Fill
         };
         side.Controls.Add(Btn("Disconnect selected", DisconnectSelected, 140));
-        side.Controls.Add(Btn("Disconnect all", async () => { Log(await Adb("disconnect")); await RefreshDevices(); }, 140));
+        side.Controls.Add(Btn("Disconnect all", async ct => { Log(await Adb("disconnect", ct: ct)); await RefreshDevices(ct); }, 140));
         side.Controls.Add(Btn("Reboot selected", RebootSelected, 140));
         side.Controls.Add(Btn("USB -> Wi-Fi", UsbToWifi, 140));
 
@@ -135,8 +133,7 @@ class MainForm : Form
         pairLeft.Controls.Add(txtCode, 1, 1);
         var pairBtns = Row(
             Btn("Pair", PairManual, 80),
-            Btn("Pair with QR", QrPair, 110),
-            Btn("Cancel QR", () => { qrCts?.Cancel(); HideQr(); return Task.CompletedTask; }, 90));
+            Btn("Pair with QR", QrPair, 110));
         pairLeft.Controls.Add(pairBtns, 0, 2);
         pairLeft.SetColumnSpan(pairBtns, 2);
         pairLeft.Dock = DockStyle.Fill;
@@ -150,8 +147,16 @@ class MainForm : Form
         pairTbl.MinimumSize = new Size(0, 128);
         var gbPair = Group("Wireless pairing", pairTbl);
 
-        // ---- Group: Log ----
-        var gbLog = Group("Log", log);
+        // ---- Group: Log (fixed height, pinned to the bottom) ----
+        var gbLog = new GroupBox
+        {
+            Text = "Log",
+            Dock = DockStyle.Bottom,
+            Height = 105,
+            Padding = new Padding(8, 4, 8, 8),
+            Margin = new Padding(0)
+        };
+        gbLog.Controls.Add(log);
 
         // ---- Footer ----
         var link = new LinkLabel
@@ -190,21 +195,25 @@ class MainForm : Form
             Dock = DockStyle.Top,
             AutoSize = true,
             ColumnCount = 1,
-            RowCount = 6,
-            Padding = new Padding(8)
+            RowCount = 4,
+            Padding = new Padding(8, 8, 8, 0)
         };
         root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        for (int i = 0; i < 6; i++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        for (int i = 0; i < 4; i++) root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         root.Controls.Add(gbAdb, 0, 0);
         root.Controls.Add(gbDevices, 0, 1);
         root.Controls.Add(gbConnect, 0, 2);
         root.Controls.Add(gbPair, 0, 3);
-        root.Controls.Add(gbLog, 0, 4);
-        root.Controls.Add(footer, 0, 5);
+
+        var footerPanel = new Panel { Dock = DockStyle.Bottom, Height = 28, Padding = new Padding(8, 3, 8, 3) };
+        footerPanel.Controls.Add(footer);
+
         // scroll host: if the screen is too short, a scrollbar appears instead of clipping
         var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
         scroll.Controls.Add(root);
-        Controls.Add(scroll);
+        Controls.Add(scroll);       // fill (added first)
+        Controls.Add(gbLog);        // bottom
+        Controls.Add(footerPanel);  // very bottom (added last)
 
         Load += async (_, _) =>
         {
@@ -213,11 +222,11 @@ class MainForm : Form
             var wa = Screen.FromControl(this).WorkingArea;
             var frame = Size - ClientSize;
             int maxW = wa.Width - frame.Width, maxH = wa.Height - frame.Height;
-            int w = pref.Width, h = pref.Height;
+            int w = Math.Max(pref.Width, 600);
+            int h = pref.Height + gbLog.Height + footerPanel.Height + 8;
             if (h > maxH) { h = maxH; w += SystemInformation.VerticalScrollBarWidth; }
             ClientSize = new Size(Math.Min(w, maxW), h);
             Location = new Point(wa.Left + (wa.Width - Width) / 2, wa.Top + (wa.Height - Height) / 2);
-
 
             txtAdb.Text = FindAdb();
             if (txtAdb.Text == "")
@@ -229,6 +238,7 @@ class MainForm : Form
 
         FormClosing += (_, _) =>
         {
+            try { qrCts?.Cancel(); } catch { }
             try { File.WriteAllText(cfgFile, txtAdb.Text.Trim()); } catch { }
         };
     }
@@ -264,16 +274,39 @@ class MainForm : Form
         return t;
     }
 
-    Button Btn(string text, Func<Task> action, int width = 0)
+    /// <summary>
+    /// Action button. While its action is running the button turns into "Stop";
+    /// clicking it again cancels that action (the other buttons stay usable).
+    /// </summary>
+    Button Btn(string text, Func<CancellationToken, Task> action, int width = 0)
     {
         var b = new Button { Text = text, Margin = new Padding(3), Height = 26 };
         if (width > 0) b.Width = width; else b.AutoSize = true;
+
+        CancellationTokenSource? cts = null;
         b.Click += async (_, _) =>
         {
-            b.Enabled = false;
-            try { await action(); }
+            if (cts != null)
+            {
+                // already running -> this click means "stop"
+                try { cts.Cancel(); } catch { }
+                b.Enabled = false;
+                return;
+            }
+
+            var mine = new CancellationTokenSource();
+            cts = mine;
+            b.Text = "Stop";
+            try { await action(mine.Token); }
+            catch (OperationCanceledException) { Log($"Stopped: {text}"); }
             catch (Exception ex) { Log("Error: " + ex.Message); }
-            finally { b.Enabled = true; }
+            finally
+            {
+                cts = null;
+                mine.Dispose();
+                b.Text = text;
+                b.Enabled = true;
+            }
         };
         return b;
     }
@@ -336,10 +369,12 @@ class MainForm : Form
         return list.FirstOrDefault(File.Exists) ?? "";
     }
 
-    async Task<string> Adb(string args, int timeoutMs = 20000)
+    async Task<string> Adb(string args, int timeoutMs = 20000, CancellationToken ct = default)
     {
         var path = txtAdb.Text.Trim();
         if (path == "" || !File.Exists(path)) return "adb.exe not found. Set the path first.";
+
+        ct.ThrowIfCancellationRequested();
 
         var psi = new ProcessStartInfo(path, args)
         {
@@ -353,32 +388,34 @@ class MainForm : Form
         var outT = p.StandardOutput.ReadToEndAsync();
         var errT = p.StandardError.ReadToEndAsync();
 
-        using var cts = new CancellationTokenSource(timeoutMs);
-        try { await p.WaitForExitAsync(cts.Token); }
+        using var timeout = new CancellationTokenSource(timeoutMs);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, timeout.Token);
+        try { await p.WaitForExitAsync(linked.Token); }
         catch (OperationCanceledException)
         {
             try { p.Kill(true); } catch { }
-            return "Timeout: " + args;
+            ct.ThrowIfCancellationRequested();   // user pressed Stop -> propagate
+            return "Timeout: " + args;           // otherwise it was just the timeout
         }
 
         // start-server leaves a daemon holding the pipes, so don't wait forever
-        var o = await Task.WhenAny(outT, Task.Delay(1500)) == outT ? outT.Result : "";
-        var e = await Task.WhenAny(errT, Task.Delay(1500)) == errT ? errT.Result : "";
+        var o = await Task.WhenAny(outT, Task.Delay(1500, CancellationToken.None)) == outT ? outT.Result : "";
+        var e = await Task.WhenAny(errT, Task.Delay(1500, CancellationToken.None)) == errT ? errT.Result : "";
         return (o + e).Trim();
     }
 
     // ---------- actions ----------
 
-    Task Browse()
+    Task Browse(CancellationToken ct)
     {
         using var dlg = new OpenFileDialog { Filter = "adb.exe|adb.exe" };
         if (dlg.ShowDialog() == DialogResult.OK) txtAdb.Text = dlg.FileName;
         return Task.CompletedTask;
     }
 
-    async Task RefreshDevices()
+    async Task RefreshDevices(CancellationToken ct = default)
     {
-        var o = await Adb("devices -l");
+        var o = await Adb("devices -l", ct: ct);
         lstDevices.Items.Clear();
         foreach (var line in o.Split('\n'))
         {
@@ -390,76 +427,76 @@ class MainForm : Form
         UpdateStatus();
     }
 
-    async Task RestartServer()
+    async Task RestartServer(CancellationToken ct)
     {
-        Log(await Adb("kill-server"));
-        await Task.Delay(500);
-        Log(await Adb("start-server"));
-        await RefreshDevices();
+        Log(await Adb("kill-server", ct: ct));
+        await Task.Delay(500, ct);
+        Log(await Adb("start-server", ct: ct));
+        await RefreshDevices(ct);
         Log("Server restarted.");
     }
 
-    async Task Connect()
+    async Task Connect(CancellationToken ct)
     {
         var ip = txtIp.Text.Trim();
         if (ip == "") { Log("Enter the phone IP."); return; }
         var port = txtPort.Text.Trim();
         if (port == "") port = "5555";
-        Log(await Adb($"connect {ip}:{port}"));
-        await RefreshDevices();
+        Log(await Adb($"connect {ip}:{port}", ct: ct));
+        await RefreshDevices(ct);
     }
 
-    async Task DisconnectSelected()
+    async Task DisconnectSelected(CancellationToken ct)
     {
         var s = Serial();
         if (s == null) { Log("Select a device first."); return; }
-        Log(await Adb($"disconnect {s}"));
-        await RefreshDevices();
+        Log(await Adb($"disconnect {s}", ct: ct));
+        await RefreshDevices(ct);
     }
 
-    async Task RebootSelected()
+    async Task RebootSelected(CancellationToken ct)
     {
         var s = Serial();
         if (s == null) { Log("Select a device first."); return; }
-        Log(await Adb($"-s {s} reboot"));
-        await Task.Delay(1000);
-        await RefreshDevices();
+        Log(await Adb($"-s {s} reboot", ct: ct));
+        await Task.Delay(1000, ct);
+        await RefreshDevices(ct);
     }
 
-    async Task UsbToWifi()
+    async Task UsbToWifi(CancellationToken ct)
     {
         var s = Serial();
         if (s == null || s.Contains(':') || s.StartsWith("adb-")) { Log("Select a device connected via USB."); return; }
 
-        var route = await Adb($"-s {s} shell ip route");
+        var route = await Adb($"-s {s} shell ip route", ct: ct);
         var line = route.Split('\n').FirstOrDefault(l => l.Contains("wlan")) ?? route;
         var m = Regex.Match(line, @"src (\d+\.\d+\.\d+\.\d+)");
         if (!m.Success) { Log("Could not read the phone IP. Is Wi-Fi on?"); return; }
 
         var ip = m.Groups[1].Value;
-        Log(await Adb($"-s {s} tcpip 5555"));
-        await Task.Delay(2000);
-        Log(await Adb($"connect {ip}:5555"));
+        Log(await Adb($"-s {s} tcpip 5555", ct: ct));
+        await Task.Delay(2000, ct);
+        Log(await Adb($"connect {ip}:5555", ct: ct));
         txtIp.Text = ip;
         txtPort.Text = "5555";
-        await RefreshDevices();
+        await RefreshDevices(ct);
     }
 
     // ---------- mDNS / auto connect ----------
 
-    async Task<List<Svc>> Mdns()
+    async Task<List<Svc>> Mdns(CancellationToken ct)
     {
-        var o = await Adb("mdns services", 8000);
+        var o = await Adb("mdns services", 8000, ct);
         var list = new List<Svc>();
         foreach (Match m in Regex.Matches(o, @"^(\S+)\s+(_adb-tls-\w+\._tcp)\.?\s+(\S+:\d+)", RegexOptions.Multiline))
             list.Add(new Svc(m.Groups[1].Value, m.Groups[2].Value, m.Groups[3].Value));
         return list;
     }
 
-    async Task AutoConnect()
+    async Task AutoConnect(CancellationToken ct)
     {
         Log("Searching for devices (mDNS)...");
-        var svcs = (await Mdns()).Where(s => s.Type.Contains("connect")).ToList();
+        var svcs = (await Mdns(ct)).Where(s => s.Type.Contains("connect")).ToList();
         if (svcs.Count == 0)
         {
             Log("Nothing found. Turn on Wireless debugging, be on the same Wi-Fi, or enter the IP and use Scan ports.");
@@ -467,44 +504,63 @@ class MainForm : Form
         }
         foreach (var s in svcs)
         {
+            ct.ThrowIfCancellationRequested();
             Log($"Found {s.Name} at {s.Addr}");
-            Log(await Adb($"connect {s.Addr}"));
+            Log(await Adb($"connect {s.Addr}", ct: ct));
         }
-        await RefreshDevices();
+        await RefreshDevices(ct);
     }
 
     // ---------- port scan ----------
 
-    async Task ScanPorts()
+    async Task ScanPorts(CancellationToken ct)
     {
         var ip = txtIp.Text.Trim();
         if (ip == "") { Log("Enter the phone IP first."); return; }
 
-        Log($"Scanning {ip} (5555 and 30000-50000)...");
+        Log($"Scanning {ip} (5555 and 30000-50000)... press Stop to cancel.");
         var open = new ConcurrentBag<int>();
-        using var sem = new SemaphoreSlim(400);
+        int done = 0;
+        var ports = Enumerable.Range(30000, 20001).Append(5555).ToList();
 
-        var ports = Enumerable.Range(30000, 20001).Append(5555);
-        var tasks = ports.Select(async port =>
+        // run the heavy part off the UI thread so the window stays responsive
+        await Task.Run(async () =>
         {
-            await sem.WaitAsync();
-            try
+            using var sem = new SemaphoreSlim(400);
+            var tasks = ports.Select(async port =>
             {
-                using var c = new TcpClient();
-                var t = c.ConnectAsync(ip, port);
-                if (await Task.WhenAny(t, Task.Delay(400)) == t && c.Connected) open.Add(port);
-            }
-            catch { }
-            finally { sem.Release(); }
-        }).ToList();
-        await Task.WhenAll(tasks);
+                try { await sem.WaitAsync(ct); }
+                catch (OperationCanceledException) { return; }
+                try
+                {
+                    using var c = new TcpClient();
+                    using var to = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    to.CancelAfter(400);
+                    try
+                    {
+                        await c.ConnectAsync(ip, port, to.Token);
+                        if (c.Connected) open.Add(port);
+                    }
+                    catch { }
+                }
+                finally
+                {
+                    sem.Release();
+                    Interlocked.Increment(ref done);
+                }
+            }).ToList();
+            await Task.WhenAll(tasks);
+        }, CancellationToken.None);
+
+        ct.ThrowIfCancellationRequested();
 
         if (open.IsEmpty) { Log("No open ports found."); return; }
         Log("Open ports: " + string.Join(", ", open.OrderBy(x => x)));
 
         foreach (var port in open.OrderBy(x => x))
         {
-            var r = await Adb($"connect {ip}:{port}");
+            ct.ThrowIfCancellationRequested();
+            var r = await Adb($"connect {ip}:{port}", ct: ct);
             Log($"{ip}:{port} -> {r}");
             if (r.Contains("connected to"))
             {
@@ -512,17 +568,17 @@ class MainForm : Form
                 break;
             }
         }
-        await RefreshDevices();
+        await RefreshDevices(ct);
     }
 
     // ---------- pairing ----------
 
-    async Task PairManual()
+    async Task PairManual(CancellationToken ct)
     {
         var addr = txtPairAddr.Text.Trim();
         var code = txtCode.Text.Trim();
         if (addr == "" || code == "") { Log("Enter ip:port and the pairing code."); return; }
-        Log(await Adb($"pair {addr} {code}"));
+        Log(await Adb($"pair {addr} {code}", ct: ct));
     }
 
     void ShowQr(string text)
@@ -534,11 +590,12 @@ class MainForm : Form
         picQr.Visible = true;
     }
 
-    async Task QrPair()
+    async Task QrPair(CancellationToken outer)
     {
         qrCts?.Cancel();
-        qrCts = new CancellationTokenSource();
-        var ct = qrCts.Token;
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(outer);
+        qrCts = cts;
+        var ct = cts.Token;
 
         string name = "ADB_" + Random.Shared.Next(100000, 999999);
         string pass = Random.Shared.Next(10000000, 99999999).ToString();
@@ -550,13 +607,13 @@ class MainForm : Form
             for (int i = 0; i < 120; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                var svc = (await Mdns()).FirstOrDefault(s => s.Type.Contains("pairing") && s.Name == name);
+                var svc = (await Mdns(ct)).FirstOrDefault(s => s.Type.Contains("pairing") && s.Name == name);
                 if (svc != null)
                 {
-                    Log(await Adb($"pair {svc.Addr} {pass}"));
+                    Log(await Adb($"pair {svc.Addr} {pass}", ct: ct));
                     HideQr();
                     await Task.Delay(2000, ct);
-                    await AutoConnect();
+                    await AutoConnect(ct);
                     return;
                 }
                 await Task.Delay(1000, ct);
@@ -564,6 +621,14 @@ class MainForm : Form
             Log("QR expired. Try again.");
             HideQr();
         }
-        catch (OperationCanceledException) { Log("QR pairing cancelled."); }
+        catch (OperationCanceledException)
+        {
+            HideQr();
+            throw;   // the button reports "Stopped"
+        }
+        finally
+        {
+            if (ReferenceEquals(qrCts, cts)) qrCts = null;
+        }
     }
 }
